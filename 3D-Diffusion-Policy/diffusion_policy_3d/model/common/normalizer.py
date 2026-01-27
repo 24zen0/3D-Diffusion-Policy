@@ -1,7 +1,6 @@
 from typing import Union, Dict
 
 import unittest
-import zarr
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,7 +13,7 @@ class LinearNormalizer(DictOfTensorMixin):
     
     @torch.no_grad()
     def fit(self,
-        data: Union[Dict, torch.Tensor, np.ndarray, zarr.Array],
+        data: Union[Dict, torch.Tensor, np.ndarray],
         last_n_dims=1,
         dtype=torch.float32,
         mode='limits',
@@ -103,7 +102,7 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
     
     @torch.no_grad()
     def fit(self,
-            data: Union[torch.Tensor, np.ndarray, zarr.Array],
+            data: Union[torch.Tensor, np.ndarray],
             last_n_dims=1,
             dtype=torch.float32,
             mode='limits',
@@ -121,7 +120,7 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
             fit_offset=fit_offset)
     
     @classmethod
-    def create_fit(cls, data: Union[torch.Tensor, np.ndarray, zarr.Array], **kwargs):
+    def create_fit(cls, data: Union[torch.Tensor, np.ndarray], **kwargs):
         obj = cls()
         obj.fit(data, **kwargs)
         return obj
@@ -179,7 +178,7 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
 
 
 
-def _fit(data: Union[torch.Tensor, np.ndarray, zarr.Array],
+def _fit(data: Union[torch.Tensor, np.ndarray],
         last_n_dims=1,
         dtype=torch.float32,
         mode='limits',
@@ -192,8 +191,14 @@ def _fit(data: Union[torch.Tensor, np.ndarray, zarr.Array],
     assert output_max > output_min
 
     # convert data to torch and type
-    if isinstance(data, zarr.Array):
-        data = data[:]
+    # Import tensorflow locally to handle optional dependency
+    try:
+        import tensorflow as tf
+    except ImportError:
+        tf = None
+
+    if tf is not None and isinstance(data, tf.Tensor):
+       data = data.numpy()
     if isinstance(data, np.ndarray):
         data = torch.from_numpy(data)
     if dtype is not None:

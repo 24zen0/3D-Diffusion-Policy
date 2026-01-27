@@ -10,6 +10,9 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
+print(f"CUDA is available: {torch.cuda.is_available()}")
+print(f"Current device: {torch.cuda.current_device()}")
+print(f"GPU name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 import dill
 from omegaconf import OmegaConf
 import pathlib
@@ -38,10 +41,16 @@ class TrainDP3Workspace:
     include_keys = ['global_step', 'epoch']
     exclude_keys = tuple()
 
+
     def __init__(self, cfg: OmegaConf, output_dir=None):
         self.cfg = cfg
         self._output_dir = output_dir
         self._saving_thread = None
+        if cfg.training.device == 'cuda':
+            assert torch.cuda.is_available(), "CUDA is not available on your system"
+            device = torch.device("cuda:0")
+        else:
+            device = torch.device("cpu")
         
         # set seed
         seed = cfg.training.seed
@@ -165,12 +174,11 @@ class TrainDP3Workspace:
         )
 
         # device transfer
-        device = torch.device(cfg.training.device)
+        device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
-
         # save batch for sampling
         train_sampling_batch = None
 
@@ -493,12 +501,14 @@ class TrainDP3Workspace:
         return torch.load(open(path, 'rb'), pickle_module=dill)
     
 
-@hydra.main(
-    version_base=None,
-    config_path=str(pathlib.Path(__file__).parent.joinpath(
-        'diffusion_policy_3d', 'config'))
-)
+@hydra.main(version_base=None,
+           config_path=str(pathlib.Path(__file__).parent.joinpath('diffusion_policy_3d','config')),
+           config_name="dp3")
+
 def main(cfg):
+    print("task.name:", cfg.task.name)
+    print("action shape:", cfg.shape_meta.action.shape)
+
     workspace = TrainDP3Workspace(cfg)
     workspace.run()
 

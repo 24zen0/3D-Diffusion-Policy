@@ -1,0 +1,53 @@
+name: elephant_6w
+
+task_name: elephant_6w
+
+shape_meta: &shape_meta
+  # acceptable types: point_cloud, low_dim
+  obs:
+    point_cloud:
+      shape: [1024, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [9]
+      type: low_dim
+  action:
+    # command_joint_position (9) 
+    shape: [9]
+
+# Offline training only
+env_runner: null
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.robosuite_pointcloud_dataset.RobosuitePointcloudDataset
+
+  # Root folder containing per-UUID TFDS dirs (each has dataset_info.json)
+  rlds_root: /mnt/project/simvla/data/deploy-data/elephant-6w/graspsim_train
+
+  split_prefer: train
+
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.0
+  max_train_episodes: 2
+
+  # RLDS keys (verified by your print)
+  depth_key: depth0
+  camera_index: 0
+  joint_position_key: joint_position
+  command_joint_position_key: command_joint_position
+  eef_width_key: eef_width
+
+  # Point cloud parameters
+  n_points: 1024
+  downsample_method: fps  # fps (slow) | random (fast)
+  workspace_bounds: [0.05, 3.0, -0.8, 1.0, -0.25, 2.0]
+
+  # Only compute point clouds for the first n_obs_steps, then repeat the last one
+  # (DP3 uses only the first n_obs_steps for conditioning when obs_as_global_cond=true)
+  n_obs_steps: ${n_obs_steps}
+
+  # Cache a few episodes in memory to avoid re-reading TFDS every __getitem__
+  cache_size: 2
