@@ -260,7 +260,8 @@ class RobosuitePointcloudDataset(BaseDataset):
         pad_after: int = 0,
         seed: int = 42,
         val_ratio: float = 0.0,
-        max_train_episodes: Optional[int] = 2, #None
+        max_train_episodes: Optional[int] = 100, #fake
+
         split_prefer: str = "train",
         # keys
         depth_key: str = "depth0",
@@ -332,6 +333,7 @@ class RobosuitePointcloudDataset(BaseDataset):
         # scan episodes (lightweight: do NOT tfds.as_numpy(steps) here)
         self.episodes: List[EpisodeRef] = []
         total_episodes_added = 0
+        count=0
 
         for bdir in self.builder_dirs:
             builder = tfds.builder_from_directory(bdir)
@@ -342,6 +344,8 @@ class RobosuitePointcloudDataset(BaseDataset):
                 read_config=self.read_config,
                 decoders={"steps": tfds.decode.SkipDecoding()},
             )
+            print(f"{count}th builder_dir: {bdir}, split: {split}")
+            count+=1
             for traj_idx, tr in enumerate(ds):
                 jp = tr["steps"]["action"][self.eef_position_key]
                 T = jp.shape[0]
@@ -362,12 +366,13 @@ class RobosuitePointcloudDataset(BaseDataset):
                 ))
 
                 total_episodes_added += 1
+                print(f"{traj_idx}: Discovered episode: builder_dir={bdir}, traj_idx={traj_idx}, length={T}")
 
                 # Early termination if we've reached the max_train_episodes limit
                 if self.max_train_episodes is not None and total_episodes_added >= self.max_train_episodes:
                     print(f"Early termination: Reached max_train_episodes limit ({self.max_train_episodes}) during dataset initialization.")
                     break
-
+            print(f"out {count} times")
             # Break outer loop as well if we've reached the limit
             if self.max_train_episodes is not None and total_episodes_added >= self.max_train_episodes:
                 break

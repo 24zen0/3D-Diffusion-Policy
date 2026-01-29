@@ -77,15 +77,15 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 8
-  num_workers: 0
+  batch_size: 32
+  num_workers: 6
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 8
-  num_workers: 0
+  batch_size: 32
+  num_workers: 6
   shuffle: False
   pin_memory: True
   persistent_workers: False
