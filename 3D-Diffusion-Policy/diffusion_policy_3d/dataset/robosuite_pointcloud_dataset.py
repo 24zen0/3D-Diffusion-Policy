@@ -9,9 +9,9 @@ Output format (sequence sample):
   {
     "obs": {
       "point_cloud": (horizon, K, 3) float32,
-      "agent_pos":   (horizon, 9)    float32,   # joint_position
+      "agent_pos":   (horizon, 8)    float32,   # eef_position(3) + eef_orientation(4) + gripper_proprio(1)
     },
-    "action":        (horizon, 10)   float32,   # command_joint_position (9) + eef_width (1)
+    "action":        (horizon, 8)    float32,   # command_eef_position(3) + command_eef_orientation(4) + gripper_action(1)
   }
 
 Notes
@@ -62,18 +62,35 @@ class EpisodeRef:
 @dataclass
 class EpisodeData:
     depth_seq: np.ndarray                 # (T,) dtype=object (bytes)
-    joint_pos: np.ndarray                 # (T, 9) float32
-    command_joint_pos: np.ndarray         # (T, 9) float32
-    eef_width: np.ndarray                 # (T, 1) float32
+    eef_position: np.ndarray              # (T, 3) float32, eef_position
+    eef_orientation: np.ndarray           # (T, 4) float32, eef_orientation
+    command_eef_position: np.ndarray      # (T, 3) float32, command_eef_position
+    command_eef_orientation: np.ndarray   # (T, 4) float32, command_eef_orientation
+    gripper_proprio: np.ndarray           # (T, 1) float32
+    gripper_action: np.ndarray            # (T, 1) float32
 
     @property
     def T(self) -> int:
-        return int(self.joint_pos.shape[0])
+        return int(self.eef_position.shape[0])
 
     @property
     def action(self) -> np.ndarray:
-        # (T,10)
-        return np.concatenate([self.command_joint_pos, self.eef_width], axis=-1).astype(np.float32)
+        # (T,8) command_eef_position(3) + command_eef_orientation(4) + gripper_action(1)
+        return np.concatenate([
+            self.command_eef_position,
+            self.command_eef_orientation,
+            self.gripper_action
+        ], axis=-1).astype(np.float32)
+
+    @property
+    def eef_pos_orientation(self) -> np.ndarray:
+        # (T,7) eef_position(3) + eef_orientation(4)
+        return np.concatenate([self.eef_position, self.eef_orientation], axis=-1).astype(np.float32)
+
+    @property
+    def agent_pos(self) -> np.ndarray:
+        # (T,8) eef_position(3) + eef_orientation(4) + gripper_proprio(1)
+        return np.concatenate([self.eef_pos_orientation, self.gripper_proprio], axis=-1).astype(np.float32)
 
 
 def _disable_tf_gpu_if_possible():
@@ -248,9 +265,12 @@ class RobosuitePointcloudDataset(BaseDataset):
         # keys
         depth_key: str = "depth0",
         camera_index: int = 0,
-        joint_position_key: str = "joint_position",
-        command_joint_position_key: str = "command_joint_position",
-        eef_width_key: str = "eef_width",
+        eef_position_key: str = "eef_position",
+        eef_orientation_key: str = "eef_orientation",
+        command_eef_position_key: str = "command_eef_position",
+        command_eef_orientation_key: str = "command_eef_orientation",
+        gripper_proprio_key: str = "gripper_proprio",
+        gripper_action_key: str = "gripper_action",
         # point cloud
         n_points: int = 1024,
         workspace_bounds: Tuple[float, float, float, float, float, float] = (0.05, 3.0, -0.8, 1.0, -0.25, 2.0),
@@ -280,9 +300,12 @@ class RobosuitePointcloudDataset(BaseDataset):
 
         self.depth_key = depth_key
         self.camera_index = int(camera_index)
-        self.joint_position_key = joint_position_key
-        self.command_joint_position_key = command_joint_position_key
-        self.eef_width_key = eef_width_key
+        self.eef_position_key = eef_position_key
+        self.eef_orientation_key = eef_orientation_key
+        self.command_eef_position_key = command_eef_position_key
+        self.command_eef_orientation_key = command_eef_orientation_key
+        self.gripper_proprio_key = gripper_proprio_key
+        self.gripper_action_key = gripper_action_key
 
         self.n_points = int(n_points)
         self.workspace_bounds = workspace_bounds
@@ -320,7 +343,7 @@ class RobosuitePointcloudDataset(BaseDataset):
                 decoders={"steps": tfds.decode.SkipDecoding()},
             )
             for traj_idx, tr in enumerate(ds):
-                jp = tr["steps"]["action"][self.joint_position_key]
+                jp = tr["steps"]["action"][self.eef_position_key]
                 T = jp.shape[0]
                 if T is None:
                     T = int(tf.shape(jp)[0].numpy())
@@ -459,17 +482,26 @@ class RobosuitePointcloudDataset(BaseDataset):
         act = steps["action"]
 
         depth_seq = obs[self.depth_key]
-        joint_pos = act[self.joint_position_key].astype(np.float32)
-        cmd_joint_pos = act[self.command_joint_position_key].astype(np.float32)
-        eef_width = act[self.eef_width_key].astype(np.float32)
-        if eef_width.ndim == 1:
-            eef_width = eef_width[:, None]
+        eef_position = act[self.eef_position_key].astype(np.float32)
+        eef_orientation = act[self.eef_orientation_key].astype(np.float32)
+        cmd_eef_position = act[self.command_eef_position_key].astype(np.float32)
+        cmd_eef_orientation = act[self.command_eef_orientation_key].astype(np.float32)
+        gripper_proprio = act[self.gripper_proprio_key].astype(np.float32)
+        gripper_action = act[self.gripper_action_key].astype(np.float32)
+
+        if gripper_proprio.ndim == 1:
+            gripper_proprio = gripper_proprio[:, None]
+        if gripper_action.ndim == 1:
+            gripper_action = gripper_action[:, None]
 
         data = EpisodeData(
             depth_seq=depth_seq,
-            joint_pos=joint_pos,
-            command_joint_pos=cmd_joint_pos,
-            eef_width=eef_width,
+            eef_position=eef_position,
+            eef_orientation=eef_orientation,
+            command_eef_position=cmd_eef_position,
+            command_eef_orientation=cmd_eef_orientation,
+            gripper_proprio=gripper_proprio,
+            gripper_action=gripper_action,
         )
         self._cache_put(key, data)
         return data
@@ -496,7 +528,7 @@ class RobosuitePointcloudDataset(BaseDataset):
         for epi_id in epi_ids:
             epi = self.episodes[int(epi_id)]
             ed = self._load_episode_data(epi)
-            agent_list.append(ed.joint_pos)
+            agent_list.append(ed.agent_pos)
             action_list.append(ed.action)
 
         agent = np.concatenate(agent_list, axis=0)
@@ -525,8 +557,8 @@ class RobosuitePointcloudDataset(BaseDataset):
 
         rng = np.random.default_rng(self.seed + int(idx))
 
-        agent_pos_win = _pad_window(ed.joint_pos, start, self.horizon)  # (H,9)
-        action_win = _pad_window(ed.action, start, self.horizon)        # (H,10)
+        agent_pos_win = _pad_window(ed.agent_pos, start, self.horizon)  # (H,8)
+        action_win = _pad_window(ed.action, start, self.horizon)        # (H,8)
 
         pcd_seq = np.zeros((self.horizon, self.n_points, 3), dtype=np.float32)
 

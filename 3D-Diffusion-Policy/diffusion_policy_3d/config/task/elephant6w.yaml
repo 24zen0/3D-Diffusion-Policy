@@ -9,11 +9,10 @@ shape_meta: &shape_meta
       shape: [1024, 3]
       type: point_cloud
     agent_pos:
-      shape: [9]
+      shape: [8]
       type: low_dim
   action:
-    # command_joint_position (9) 
-    shape: [9]
+    shape: [8] #command_eef position(3)+command_eef quaternion(4)+gripper action(1)
 
 # Offline training only
 env_runner: null
@@ -36,9 +35,12 @@ dataset:
   # RLDS keys (verified by your print)
   depth_key: depth0
   camera_index: 0
-  joint_position_key: joint_position
-  command_joint_position_key: command_joint_position
-  eef_width_key: eef_width
+  eef_position_key: eef_position
+  eef_orientation_key: eef_orientation
+  command_eef_position_key: command_eef_position
+  command_eef_orientation_key: command_eef_orientation
+  gripper_proprio_key: gripper_proprio
+  gripper_action_key: gripper_action
 
   # Point cloud parameters
   n_points: 1024
