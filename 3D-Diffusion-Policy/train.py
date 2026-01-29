@@ -122,6 +122,13 @@ class TrainDP3Workspace:
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        # after train_dataloader is created
+        print("[DEBUG] len(train_dataloader) =", len(train_dataloader))
+        print("[DEBUG] gradient_accumulate_every =", cfg.training.gradient_accumulate_every)
+
+        # 额外：算每个 epoch 的“更新步”（optimizer.step 次数）
+        steps_per_epoch = len(train_dataloader) // cfg.training.gradient_accumulate_every
+        print("[DEBUG] steps_per_epoch(update) =", steps_per_epoch)
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
