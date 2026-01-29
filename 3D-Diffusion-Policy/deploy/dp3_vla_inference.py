@@ -2,6 +2,7 @@
 from urchin import URDF, Collision, Sphere, Geometry  # type: ignore  # must stay first (parity with vla_inference.py)
 
 import os  # stdlib for env + paths
+import transforms3d as t3d  
 # Optional VSCode/pydev remote debugging; mirrors vla_inference entry.
 if 'DEBUG_PORT' in os.environ:  # optional remote debugging hook
     import debugpy  # debugger entry
@@ -34,12 +35,33 @@ torch.autograd.set_grad_enabled(False)  # force inference-only mode
 
 import hydra  # config instantiation
 import dill  # pickle support for torch.load
+import sys
+import os
+sys.path.append('/mnt/home/zengyitao/DP3baseline/3D-Diffusion-Policy/3D-Diffusion-Policy')
 
 from diffusion_policy_3d.policy.dp3 import DP3  # DP3 policy
 
 # -------------------------------------------------------------------------------------- #
 # Point cloud helpers (subset of robosuite_pointcloud_dataset: _crop_workspace, sampling)
 # -------------------------------------------------------------------------------------- #
+
+def ensure_agent_pos_dim8(prop: np.ndarray) -> np.ndarray:
+    """
+    Accepts:
+      - 8D: [x,y,z,qw,qx,qy,qz,grip] -> return as-is
+      - 7D: [x,y,z,roll,pitch,yaw,grip] -> convert rpy -> quat, output 8D
+    """
+    prop = np.asarray(prop, dtype=np.float32).reshape(-1)
+    if prop.shape[0] == 8:
+        return prop.astype(np.float32)
+
+    if prop.shape[0] == 7:
+        x, y, z, roll, pitch, yaw, grip = prop.tolist()
+        # transforms3d: euler2quat returns (w, x, y, z) by default for given axes
+        qw, qx, qy, qz = t3d.euler.euler2quat(roll, pitch, yaw, axes='sxyz')
+        return np.array([x, y, z, qw, qx, qy, qz, grip], dtype=np.float32)
+
+    raise ValueError(f"agent_pos must be 7 (xyz+rpy+grip) or 8 (xyz+quat+grip), got {prop.shape[0]}")
 
 
 def _get_uv_grid(H: int, W: int, cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]):
@@ -175,7 +197,9 @@ def build_obs(sample: dict,
         pcs.append(pc)
 
         prop = proprio_seq[min(i, len(proprio_seq) - 1)]
-        props.append(np.array(prop, dtype=np.float32))
+        prop = ensure_agent_pos_dim8(prop)
+        props.append(prop)
+
 
     point_cloud = np.stack(pcs, axis=0)
     agent_pos = np.stack(props, axis=0)
@@ -251,7 +275,7 @@ def warmup(dp3_model: DP3, device: torch.device, n_points, bounds, uv_cache):
             'image_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
             'image_wrist_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
             'depth_array': [np.zeros((256, 256), dtype=np.float32)],
-            'proprio_array': [np.zeros((7,), dtype=np.float32)] * 4,
+            'proprio_array': [np.array([0,0,0, 1,0,0,0, 0], dtype=np.float32)] * 4,
             'traj_metadata': None,
             'env_id': 1,
         },
