@@ -260,7 +260,7 @@ class RobosuitePointcloudDataset(BaseDataset):
         pad_after: int = 0,
         seed: int = 42,
         val_ratio: float = 0.0,
-        max_train_episodes: Optional[int] = 100, #fake
+        max_train_episodes: Optional[int] = 5, #fake
 
         split_prefer: str = "train",
         # keys
@@ -347,7 +347,7 @@ class RobosuitePointcloudDataset(BaseDataset):
             print(f"{count}th builder_dir: {bdir}, split: {split}")
             count+=1
             for traj_idx, tr in enumerate(ds):
-                jp = tr["steps"]["action"][self.eef_position_key]
+                jp = tr["steps"]["action"][self.eef_position_key]#怎么没有orientation？
                 T = jp.shape[0]
                 if T is None:
                     T = int(tf.shape(jp)[0].numpy())
@@ -532,6 +532,7 @@ class RobosuitePointcloudDataset(BaseDataset):
         action_list = []
         for epi_id in epi_ids:
             epi = self.episodes[int(epi_id)]
+            #在这里加载数据
             ed = self._load_episode_data(epi)
             agent_list.append(ed.agent_pos)
             action_list.append(ed.action)

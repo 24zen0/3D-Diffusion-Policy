@@ -30,7 +30,7 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
   val_ratio: 0.0
-  max_train_episodes: 20
+  max_train_episodes: 10
 
   # RLDS keys (verified by your print)
   depth_key: depth0

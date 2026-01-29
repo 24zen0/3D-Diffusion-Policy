@@ -175,8 +175,15 @@ class TrainDP3Workspace:
         )
 
         # configure checkpoint
+        # Use custom experiment name for checkpoint directory if provided
+        checkpoint_save_dir = os.path.join(self.output_dir, 'checkpoints')
+        custom_exp_name = cfg.get('exp_name', 'debug')
+        if custom_exp_name != 'debug':
+            # Create a more descriptive checkpoint directory using the custom name
+            checkpoint_save_dir = os.path.join(self.output_dir, f'checkpoints_{custom_exp_name}')
+
         topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
+            save_dir=checkpoint_save_dir,
             **cfg.checkpoint.topk
         )
 
@@ -386,12 +393,17 @@ class TrainDP3Workspace:
         return output_dir
     
 
-    def save_checkpoint(self, path=None, tag='latest', 
+    def save_checkpoint(self, path=None, tag='latest',
             exclude_keys=None,
             include_keys=None,
             use_thread=False):
         if path is None:
-            path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
+            # Use custom experiment name in checkpoint path if provided
+            custom_exp_name = self.cfg.get('exp_name', 'debug')
+            if custom_exp_name != 'debug':
+                path = pathlib.Path(self.output_dir).joinpath(f'checkpoints_{custom_exp_name}', f'{tag}.ckpt')
+            else:
+                path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
         else:
             path = pathlib.Path(path)
         if exclude_keys is None:
@@ -404,7 +416,7 @@ class TrainDP3Workspace:
             'cfg': self.cfg,
             'state_dicts': dict(),
             'pickles': dict()
-        } 
+        }
 
         for key, value in self.__dict__.items():
             if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
@@ -428,23 +440,31 @@ class TrainDP3Workspace:
         return str(path.absolute())
     
     def get_checkpoint_path(self, tag='latest'):
+        # Determine checkpoint directory based on whether custom name is used
+        custom_exp_name = self.cfg.get('exp_name', 'debug')
+        if custom_exp_name != 'debug':
+            checkpoint_dir = pathlib.Path(self.output_dir).joinpath(f'checkpoints_{custom_exp_name}')
+        else:
+            checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
+
         if tag=='latest':
-            return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
-        elif tag=='best': 
+            return checkpoint_dir.joinpath(f'{tag}.ckpt')
+        elif tag=='best':
             # the checkpoints are saved as format: epoch={}-test_mean_score={}.ckpt
             # find the best checkpoint
-            checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
             all_checkpoints = os.listdir(checkpoint_dir)
             best_ckpt = None
             best_score = -1e10
             for ckpt in all_checkpoints:
                 if 'latest' in ckpt:
                     continue
-                score = float(ckpt.split('test_mean_score=')[1].split('.ckpt')[0])
-                if score > best_score:
-                    best_ckpt = ckpt
-                    best_score = score
-            return pathlib.Path(self.output_dir).joinpath('checkpoints', best_ckpt)
+                # Handle both regular format and custom name format
+                if 'test_mean_score=' in ckpt:
+                    score = float(ckpt.split('test_mean_score=')[1].split('.ckpt')[0])
+                    if score > best_score:
+                        best_ckpt = ckpt
+                        best_score = score
+            return checkpoint_dir.joinpath(best_ckpt)
         else:
             raise NotImplementedError(f"tag {tag} not implemented")
             
@@ -498,7 +518,12 @@ class TrainDP3Workspace:
         However, loading a snapshot assumes the code stays exactly the same.
         Use save_checkpoint for long-term storage.
         """
-        path = pathlib.Path(self.output_dir).joinpath('snapshots', f'{tag}.pkl')
+        # Use custom experiment name in snapshot path if provided
+        custom_exp_name = self.cfg.get('exp_name', 'debug')
+        if custom_exp_name != 'debug':
+            path = pathlib.Path(self.output_dir).joinpath(f'snapshots_{custom_exp_name}', f'{tag}.pkl')
+        else:
+            path = pathlib.Path(self.output_dir).joinpath('snapshots', f'{tag}.pkl')
         path.parent.mkdir(parents=False, exist_ok=True)
         torch.save(self, path.open('wb'), pickle_module=dill)
         return str(path.absolute())
@@ -515,6 +540,18 @@ class TrainDP3Workspace:
 def main(cfg):
     print("task.name:", cfg.task.name)
     print("action shape:", cfg.shape_meta.action.shape)
+
+    # Allow custom experiment name to be passed via command line using exp_name
+    # This will be used for both wandb run name and checkpoint directory
+    # Users can run: python train.py exp_name=my_custom_name
+    custom_exp_name = cfg.get('exp_name', 'default')
+    # Only use custom name if it's different from the default 'debug'
+    if custom_exp_name != 'debug':
+        # Update wandb logging name to use the custom name
+        cfg.logging.name = custom_exp_name
+        # Also update the group if needed
+        if cfg.logging.get('group') == '${exp_name}' or cfg.logging.get('group') == 'debug':
+            cfg.logging.group = custom_exp_name
 
     workspace = TrainDP3Workspace(cfg)
     workspace.run()
