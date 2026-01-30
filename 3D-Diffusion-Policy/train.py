@@ -41,7 +41,6 @@ class TrainDP3Workspace:
     include_keys = ['global_step', 'epoch']
     exclude_keys = tuple()
 
-
     def __init__(self, cfg: OmegaConf, output_dir=None):
         self.cfg = cfg
         self._output_dir = output_dir
@@ -67,7 +66,6 @@ class TrainDP3Workspace:
                 self.ema_model = copy.deepcopy(self.model)
             except: # minkowski engine could not be copied. recreate it
                 self.ema_model = hydra.utils.instantiate(cfg.policy)
-
 
         # configure training state
         self.optimizer = hydra.utils.instantiate(
@@ -195,7 +193,6 @@ class TrainDP3Workspace:
         optimizer_to(self.optimizer, device)
         # save batch for sampling
         train_sampling_batch = None
-
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
@@ -397,21 +394,41 @@ class TrainDP3Workspace:
             exclude_keys=None,
             include_keys=None,
             use_thread=False):
+        # keep a monotonic archive filename and optionally maintain a pointer file (e.g., latest.ckpt)
+        pointer_path = None
         if path is None:
             # Use custom experiment name in checkpoint path if provided
             custom_exp_name = self.cfg.get('exp_name', 'debug')
-            if custom_exp_name != 'debug':
-                path = pathlib.Path(self.output_dir).joinpath(f'checkpoints_{custom_exp_name}', f'{tag}.ckpt')
-            else:
-                path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
+            checkpoint_dir = pathlib.Path(self.output_dir).joinpath(
+                f'checkpoints_{custom_exp_name}' if custom_exp_name != 'debug' else 'checkpoints'
+            )
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+            archive_filename = f'{tag}_epoch={self.epoch:04d}-step={self.global_step:07d}.ckpt'
+            path = checkpoint_dir.joinpath(archive_filename)
+            pointer_path = checkpoint_dir.joinpath(f'{tag}.ckpt') if tag is not None else None
         else:
             path = pathlib.Path(path)
+
+        # avoid overwriting an existing archive checkpoint
+        def _get_unique_path(target_path: pathlib.Path) -> pathlib.Path:
+            if not target_path.exists():
+                return target_path
+            stem, suffix = target_path.stem, target_path.suffix
+            idx = 1
+            while True:
+                candidate = target_path.with_name(f"{stem}_v{idx}{suffix}")
+                if not candidate.exists():
+                    return candidate
+                idx += 1
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path = _get_unique_path(path)
         if exclude_keys is None:
             exclude_keys = tuple(self.exclude_keys)
         if include_keys is None:
             include_keys = tuple(self.include_keys) + ('_output_dir',)
 
-        path.parent.mkdir(parents=False, exist_ok=True)
         payload = {
             'cfg': self.cfg,
             'state_dicts': dict(),
@@ -428,12 +445,20 @@ class TrainDP3Workspace:
                         payload['state_dicts'][key] = value.state_dict()
             elif key in include_keys:
                 payload['pickles'][key] = dill.dumps(value)
+        def _write_checkpoint(target_path, pointer=None):
+            torch.save(payload, target_path.open('wb'), pickle_module=dill)
+            if pointer is not None and pointer != target_path:
+                try:
+                    shutil.copy2(target_path, pointer)
+                except Exception as e:
+                    print(f"[WARN] failed to update checkpoint pointer {pointer}: {e}")
+
         if use_thread:
             self._saving_thread = threading.Thread(
-                target=lambda : torch.save(payload, path.open('wb'), pickle_module=dill))
+                target=lambda : _write_checkpoint(path, pointer_path))
             self._saving_thread.start()
         else:
-            torch.save(payload, path.open('wb'), pickle_module=dill)
+            _write_checkpoint(path, pointer_path)
         
         del payload
         torch.cuda.empty_cache()
@@ -558,3 +583,4 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
+
