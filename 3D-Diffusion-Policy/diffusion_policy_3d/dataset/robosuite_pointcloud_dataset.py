@@ -9,9 +9,12 @@ Output format (sequence sample):
   {
     "obs": {
       "point_cloud": (horizon, K, 3) float32,
-      "agent_pos":   (horizon, 8)    float32,   # eef_position(3) + eef_orientation(4) + gripper_proprio(1)
+      "agent_pos":   (horizon, 8)    float32,   # eef_position(3) + eef_orientation(quat)(4) + gripper_proprio(1)
     },
-    "action":        (horizon, 8)    float32,   # command_eef_position(3) + command_eef_orientation(4) + gripper_action(1)
+    # delta action (target - previous target), matching grasp_mode.py:
+    # [dx, dy, dz, droll, dpitch, dyaw, gripper]
+    # start pose for the first step uses the measured eef_position/orientation.
+    "action":        (horizon, 7)    float32,
   }
 
 Notes
@@ -30,6 +33,8 @@ import os
 
 import numpy as np
 import torch
+from pytorch3d.ops import sample_farthest_points
+import transforms3d as t3d
 
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
@@ -68,19 +73,33 @@ class EpisodeData:
     command_eef_orientation: np.ndarray   # (T, 4) float32, command_eef_orientation
     gripper_proprio: np.ndarray           # (T, 1) float32
     gripper_action: np.ndarray            # (T, 1) float32
+    delta_action: Optional[np.ndarray] = None  # cached (T,7) float32
 
     @property
     def T(self) -> int:
         return int(self.eef_position.shape[0])
 
     @property
-    def action(self) -> np.ndarray:
+    def action_abs(self) -> np.ndarray:
         # (T,8) command_eef_position(3) + command_eef_orientation(4) + gripper_action(1)
         return np.concatenate([
             self.command_eef_position,
             self.command_eef_orientation,
             self.gripper_action
         ], axis=-1).astype(np.float32)
+
+    @property
+    def action(self) -> np.ndarray:
+        """Delta action: (T,7) [dx,dy,dz,droll,dpitch,dyaw,gripper]."""
+        if self.delta_action is None:
+            self.delta_action = _abs_actions_to_delta_sequence(
+                cmd_pos=self.command_eef_position,
+                cmd_quat=self.command_eef_orientation,
+                grip=self.gripper_action,
+                start_pos=self.eef_position[0],
+                start_quat=self.eef_orientation[0],
+            )
+        return self.delta_action
 
     @property
     def eef_pos_orientation(self) -> np.ndarray:
@@ -241,6 +260,174 @@ def _downsample_fps(points_xyz: np.ndarray, K: int, rng: np.random.Generator) ->
         farthest = int(np.argmax(dist))
 
     return points_xyz[centroids].astype(np.float32)
+
+
+# ---------------------------
+# Torch-based depth -> point cloud pipeline (used for both training & deploy)
+# ---------------------------
+
+def depth_to_points_rlds(depth_hw: np.ndarray, fx: float, fy: float, cx: float, cy: float, device: torch.device) -> torch.Tensor:
+    """
+    Convert depth (H,W) float32 to point cloud (N,3) torch Tensor on device.
+    Matches RLDS intrinsics ordering used during data collection.
+    """
+    depth = torch.from_numpy(depth_hw).to(device=device, dtype=torch.float32)
+    H, W = depth.shape
+    # build pixel grid
+    u = torch.arange(W, device=device).view(1, -1).repeat(H, 1)
+    v = torch.arange(H, device=device).view(-1, 1).repeat(1, W)
+    m = torch.isfinite(depth) & (depth > 0)
+    if not torch.any(m):
+        return torch.zeros((0, 3), device=device, dtype=torch.float32)
+    d = depth[m]
+    uu = u[m].float()
+    vv = v[m].float()
+    X = d
+    Y = -(uu - cx) * d / fx
+    Z = -(vv - cy) * d / fy
+    return torch.stack([X, Y, Z], dim=-1)
+
+
+def crop_workspace_torch(points_xyz: torch.Tensor, bounds: tuple) -> torch.Tensor:
+    """Axis-aligned crop implemented in torch."""
+    if points_xyz.numel() == 0:
+        return points_xyz
+    x0, x1, y0, y1, z0, z1 = bounds
+    X, Y, Z = points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2]
+    mask = (X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1) & (Z >= z0) & (Z <= z1)
+    return points_xyz[mask]
+
+
+def fps_torch(points_xyz: torch.Tensor, K: int, seed: int = 0) -> torch.Tensor:
+    """Farthest-point sampling using pytorch3d; falls back to padding when N==0."""
+    if points_xyz.numel() == 0:
+        return torch.zeros((K, 3), device=points_xyz.device, dtype=torch.float32)
+    torch.manual_seed(seed)
+    pts = points_xyz[None, ...]  # (1,N,3)
+    sampled, _ = sample_farthest_points(pts, K=min(K, pts.shape[1]))
+    sampled = sampled[0]
+    if sampled.shape[0] < K:
+        # repeat last if not enough
+        pad = K - sampled.shape[0]
+        sampled = torch.cat([sampled, sampled[-1:].repeat(pad, 1)], dim=0)
+    return sampled
+
+
+def _plane_from_points(p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor):
+    """Return plane normal (unit) and d in ax+by+cz+d=0."""
+    v1 = p2 - p1
+    v2 = p3 - p1
+    n = torch.cross(v1, v2)
+    norm = torch.norm(n) + 1e-8
+    n = n / norm
+    d = -torch.dot(n, p1)
+    return n, d
+
+
+def filter_dominant_plane_ransac(
+    points_xyz: torch.Tensor,
+    dist_thresh: float = 0.01,
+    iters: int = 200,
+    min_inlier_ratio: float = 0.3,
+    seed: int = 0,
+) -> torch.Tensor:
+    """
+    Very lightweight RANSAC plane remover on torch tensors.
+    Returns points with the dominant plane removed (if found).
+    """
+    N = points_xyz.shape[0]
+    if N < 3:
+        return points_xyz
+    torch.manual_seed(seed)
+    best_inliers = None
+    max_inliers = 0
+    for _ in range(iters):
+        idx = torch.randint(0, N, (3,), device=points_xyz.device)
+        p1, p2, p3 = points_xyz[idx]
+        n, d = _plane_from_points(p1, p2, p3)
+        dist = torch.abs(points_xyz @ n + d)
+        inliers = dist < dist_thresh
+        num_inliers = int(inliers.sum())
+        if num_inliers > max_inliers:
+            max_inliers = num_inliers
+            best_inliers = inliers
+    if best_inliers is None or max_inliers < int(min_inlier_ratio * N):
+        return points_xyz
+    return points_xyz[~best_inliers]
+
+
+def _normalize_quat(q: np.ndarray) -> np.ndarray:
+    """Safe quaternion normalization; fallback to identity when norm is tiny."""
+    q = np.asarray(q, dtype=np.float32)
+    n = np.linalg.norm(q)
+    if n < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return q / n
+
+
+def _quat_delta_euler(target_quat: np.ndarray, current_quat: np.ndarray) -> tuple:
+    """Return euler angles of R_target * R_current^T."""
+    R = t3d.quaternions.quat2mat(_normalize_quat(target_quat)) @ t3d.quaternions.quat2mat(
+        _normalize_quat(current_quat)
+    ).T
+    return t3d.euler.mat2euler(R)
+
+
+def _discretize_gripper(val: float) -> float:
+    """Quantize continuous gripper logits into {-1, 0, 1} for stability."""
+    if val < -0.5:
+        return -1.0
+    if val > 0.5:
+        return 1.0
+    return 0.0
+
+
+def _abs_actions_to_delta_sequence(
+    cmd_pos: np.ndarray,
+    cmd_quat: np.ndarray,
+    grip: np.ndarray,
+    start_pos: np.ndarray,
+    start_quat: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert absolute action targets into sequential deltas:
+    delta_0 uses measured start pose; later deltas use previous command as the running pose.
+    """
+    cmd_pos = np.asarray(cmd_pos, dtype=np.float32)
+    cmd_quat = np.asarray(cmd_quat, dtype=np.float32)
+    grip = np.asarray(grip, dtype=np.float32).reshape(cmd_pos.shape[0], -1)
+
+    curr_pos = np.asarray(start_pos, dtype=np.float32).reshape(-1)
+    curr_quat = _normalize_quat(np.asarray(start_quat, dtype=np.float32).reshape(-1))
+
+    deltas = []
+    for i in range(cmd_pos.shape[0]):
+        tgt_pos = cmd_pos[i].reshape(-1)
+        tgt_quat = _normalize_quat(cmd_quat[i].reshape(-1))
+
+        delta_pos = tgt_pos - curr_pos
+        delta_euler = _quat_delta_euler(tgt_quat, curr_quat)
+        grip_val = _discretize_gripper(float(grip[i, 0] if grip.shape[1] > 0 else grip[i]))
+
+        deltas.append(
+            np.array(
+                [
+                    delta_pos[0],
+                    delta_pos[1],
+                    delta_pos[2],
+                    delta_euler[0],
+                    delta_euler[1],
+                    delta_euler[2],
+                    grip_val,
+                ],
+                dtype=np.float32,
+            )
+        )
+
+        curr_pos = tgt_pos
+        curr_quat = tgt_quat
+
+    return np.stack(deltas, axis=0)
 
 
 def _pad_window(seq: np.ndarray, start: int, horizon: int) -> np.ndarray:
@@ -561,24 +748,32 @@ class RobosuitePointcloudDataset(BaseDataset):
         epi = self.episodes[epi_id]
         ed = self._load_episode_data(epi)
 
-        rng = np.random.default_rng(self.seed + int(idx))
-
         agent_pos_win = _pad_window(ed.agent_pos, start, self.horizon)  # (H,8)
-        action_win = _pad_window(ed.action, start, self.horizon)        # (H,8)
+        action_win = _pad_window(ed.action, start, self.horizon)        # (H,7) delta
 
-        pcd_seq = np.zeros((self.horizon, self.n_points, 3), dtype=np.float32)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pcd_seq = torch.zeros((self.horizon, self.n_points, 3), device=device, dtype=torch.float32)
 
         # only compute first n_obs_steps, then repeat last
         To = min(self.n_obs_steps, self.horizon)
         for i in range(To):
             src_t = int(np.clip(start + i, 0, ed.T - 1))
             depth_hw = _decode_depth(ed.depth_seq[src_t])
-            pts = _depth_to_points(depth_hw, epi.fx, epi.fy, epi.cx, epi.cy, self._uv_cache)
-            pts = _crop_workspace(pts, self.workspace_bounds)
-            pcd_seq[i] = self._downsample(pts, rng)
+
+            pts = depth_to_points_rlds(depth_hw, epi.fx, epi.fy, epi.cx, epi.cy, device=device)
+            pts = crop_workspace_torch(pts, self.workspace_bounds)
+            pts = fps_torch(pts, K=10000, seed=0)
+            pts = filter_dominant_plane_ransac(
+                pts, dist_thresh=0.01, iters=200, min_inlier_ratio=0.30, seed=0
+            )
+            pts = fps_torch(pts, K=self.n_points, seed=999)
+            pcd_seq[i] = pts
 
         if To < self.horizon:
             pcd_seq[To:] = pcd_seq[max(To - 1, 0)]
+
+        # move back to cpu numpy for collate (DataLoader will stack tensors)
+        pcd_seq = pcd_seq.cpu().numpy()
 
         data = {
             "obs": {

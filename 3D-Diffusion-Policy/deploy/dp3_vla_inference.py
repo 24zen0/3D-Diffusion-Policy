@@ -40,6 +40,12 @@ import os
 sys.path.append('/mnt/home/zengyitao/DP3baseline/3D-Diffusion-Policy/3D-Diffusion-Policy')
 
 from diffusion_policy_3d.policy.dp3 import DP3  # DP3 policy
+from diffusion_policy_3d.dataset.robosuite_pointcloud_dataset import (
+    depth_to_points_rlds,
+    crop_workspace_torch,
+    fps_torch,
+    filter_dominant_plane_ransac,
+)
 
 # -------------------------------------------------------------------------------------- #
 # Point cloud helpers (subset of robosuite_pointcloud_dataset: _crop_workspace, sampling)
@@ -171,23 +177,26 @@ def depth_to_pointcloud(depth_hw: np.ndarray,
                         uv_cache: dict,
                         rng: np.random.Generator) -> np.ndarray:
     """
-    Convert depth (H,W) -> point cloud, then crop & downsample.
-    Intrinsics: follow robosuite_pointcloud_dataset assumption with fx=fy=W, cx=cy=W/2
-    to avoid changing the vla_inference CLI. If your camera intrinsics differ,
-    adjust here or encode real intrinsics inside depth frames before sending.
+    Convert depth (H,W) -> point cloud, then crop & two-stage FPS with plane removal.
+    Intrinsics: fx,fy,cx,cy taken from depth shape (same assumption as training).
     """
     H, W = depth_hw.shape
     fx = fy = float(W)
     cx = float(W) / 2.0
     cy = float(H) / 2.0
-    pts = _depth_to_points(depth_hw, fx, fy, cx, cy, uv_cache)
-    # Debug: monitor point count before/after cropping to catch bad depth or bounds.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    depth_tensor = torch.from_numpy(depth_hw).to(device=device, dtype=torch.float32)
+    pts = depth_to_points_rlds(depth_tensor.cpu().numpy(), fx, fy, cx, cy, device=device)
     print(f"[dp3] depth->points raw N={pts.shape[0]} H={H} W={W}")
-    pts = _crop_workspace(pts, bounds)
+    pts = crop_workspace_torch(pts, bounds)
     print(f"[dp3] after crop N={pts.shape[0]} bounds={bounds}")
-    pts = _downsample_random(pts, n_points, rng)
-    print(f"[dp3] after sample N={pts.shape[0]} (target {n_points})")
-    return pts
+    pts = fps_torch(pts, K=10000, seed=0)
+    pts = filter_dominant_plane_ransac(
+        pts, dist_thresh=0.01, iters=200, min_inlier_ratio=0.30, seed=0
+    )
+    pts = fps_torch(pts, K=n_points, seed=999)
+    print(f"[dp3] after FPS N={pts.shape[0]} (target {n_points})")
+    return pts.cpu().numpy()
 
 # ------------------------------ DP3 helpers -------------------------------- #
 
@@ -289,8 +298,15 @@ def batch_process(dp3_model: DP3,
 
     ret = []
     for env_id, act, start_pose in zip(env_ids, actions, start_poses):
-        delta_act = abs_actions_to_delta(act, start_pose)
-        print(f"[dp3] abs->delta converted | env={env_id} abs_shape={act.shape} delta_shape={delta_act.shape}")
+        if act.shape[-1] == 7:
+            delta_act = act.astype(np.float32, copy=False)
+            # discretize gripper for safety
+            delta_act = delta_act.copy()
+            delta_act[..., -1] = np.vectorize(_discretize_gripper)(delta_act[..., -1])
+            print(f"[dp3] delta passthrough | env={env_id} delta_shape={delta_act.shape}")
+        else:
+            delta_act = abs_actions_to_delta(act, start_pose)
+            print(f"[dp3] abs->delta converted | env={env_id} abs_shape={act.shape} delta_shape={delta_act.shape}")
         ret.append({
             'result': delta_act,
             'env_id': env_id,
@@ -405,4 +421,3 @@ def main():
 
 if __name__ == "__main__":  # entrypoint guard
     main()  # start server
-
